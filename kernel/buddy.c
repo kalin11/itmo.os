@@ -36,13 +36,18 @@ static Sz_info *bd_sizes;
 static void *bd_base;  // start address of memory managed by the buddy allocator
 static struct spinlock lock;
 
+// по хуйне
 // Return 1 if bit at position index in array is set to 1
 int bit_isset(char *array, int index) {
+    // находим байт в массиве, который нам нужен
     char b = array[index / 8];
+    // маска байта
     char m = (1 << (index % 8));
+    // если короче они равны, то бит установлен
     return (b & m) == m;
 }
 
+// по хуйне
 // Set bit at position index in array to 1
 void bit_set(char *array, int index) {
     char b = array[index / 8];
@@ -50,11 +55,13 @@ void bit_set(char *array, int index) {
     array[index / 8] = (b | m);
 }
 
+// по хуйне
 void flip_bit(char *array, int index) {
     index >>= 1;
     array[index / 8] ^= (1 << (index % 8));
 }
 
+// по хуйне
 // Clear bit at position index in array
 void bit_clear(char *array, int index) {
     char b = array[index / 8];
@@ -62,6 +69,7 @@ void bit_clear(char *array, int index) {
     array[index / 8] = (b & ~m);
 }
 
+// по хуйне
 // Print a bit vector as a list of ranges of 1 bits
 void bd_print_vector(char *vector, int len) {
     int last, lb;
@@ -108,14 +116,14 @@ int firstk(uint64 n) {
 
 // Compute the block index for address p at size k
 int blk_index(int k, char *p) {
-    int n = p - (char *)bd_base;
+    int n = p - (char *) bd_base;
     return n / BLK_SIZE(k);
 }
 
 // Convert a block index at size k back into an address
 void *addr(int k, int bi) {
     int n = bi * BLK_SIZE(k);
-    return (char *)bd_base + n;
+    return (char *) bd_base + n;
 }
 
 // allocate nbytes, but malloc won't return anything smaller than LEAF_SIZE
@@ -190,8 +198,8 @@ void bd_free(void *p) {
 
 // Compute the first block at size k that doesn't contain p
 int blk_index_next(int k, char *p) {
-    int n = (p - (char *)bd_base) / BLK_SIZE(k);
-    if ((p - (char *)bd_base) % BLK_SIZE(k) != 0) n++;
+    int n = (p - (char *) bd_base) / BLK_SIZE(k);
+    if ((p - (char *) bd_base) % BLK_SIZE(k) != 0) n++;
     return n;
 }
 
@@ -208,7 +216,7 @@ int log2(uint64 n) {
 void bd_mark(void *start, void *stop) {
     int bi, bj;
 
-    if (((uint64)start % LEAF_SIZE != 0) || ((uint64)stop % LEAF_SIZE != 0))
+    if (((uint64) start % LEAF_SIZE != 0) || ((uint64) stop % LEAF_SIZE != 0))
         panic("bd_mark");
 
     for (int k = 0; k < nsizes; k++) {
@@ -256,7 +264,7 @@ int bd_initfree(void *bd_left, void *bd_right) {
 
 // Mark the range [bd_base,p) as allocated
 int bd_mark_data_structures(char *p) {
-    int meta = p - (char *)bd_base;
+    int meta = p - (char *) bd_base;
     printf("bd: %d meta bytes for managing %d bytes of memory\n", meta,
            BLK_SIZE(MAXSIZE));
     bd_mark(bd_base, p);
@@ -276,30 +284,31 @@ int bd_mark_unavailable(void *end, void *left) {
 
 // Initialize the buddy allocator: it manages memory from [base, end).
 void bd_init(void *base, void *end) {
-    char *p = (char *)ROUNDUP((uint64)base, LEAF_SIZE);
+    char *p = (char *) ROUNDUP((uint64) base, LEAF_SIZE);
     int sz;
 
     initlock(&lock, "buddy");
-    bd_base = (void *)p;
+    bd_base = (void *) p;
 
     // compute the number of sizes we need to manage [base, end)
-    nsizes = log2(((char *)end - p) / LEAF_SIZE) + 1;
-    if ((char *)end - p > BLK_SIZE(MAXSIZE)) {
+    nsizes = log2(((char *) end - p) / LEAF_SIZE) + 1;
+    if ((char *) end - p > BLK_SIZE(MAXSIZE)) {
         nsizes++;  // round up to the next power of 2
     }
 
     printf("bd: memory sz is %d bytes; allocate an size array of length %d\n",
-           (char *)end - p, nsizes);
+           (char *) end - p, nsizes);
 
     // allocate bd_sizes array
-    bd_sizes = (Sz_info *)p;
+    bd_sizes = (Sz_info *) p;
     p += sizeof(Sz_info) * nsizes;
     memset(bd_sizes, 0, sizeof(Sz_info) * nsizes);
 
     // initialize free list and allocate the alloc array for each size k
     for (int k = 0; k < nsizes; k++) {
         lst_init(&bd_sizes[k].free);
-        sz = sizeof(char) * ROUNDUP(NBLK(k) / 2, 8) / 8;
+        // из-за экономии одного бита мы смогли уменьшить в 2 раза размер
+        sz = sizeof(char) * ROUNDUP(NBLK(k), 16) / 16;
         bd_sizes[k].alloc = p;
         memset(bd_sizes[k].alloc, 0, sz);
         p += sz;
@@ -313,7 +322,7 @@ void bd_init(void *base, void *end) {
         memset(bd_sizes[k].split, 0, sz);
         p += sz;
     }
-    p = (char *)ROUNDUP((uint64)p, LEAF_SIZE);
+    p = (char *) ROUNDUP((uint64) p, LEAF_SIZE);
 
     // done allocating; mark the memory range [base, p) as allocated, so
     // that buddy will not hand out that memory.
