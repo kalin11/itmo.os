@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -44,7 +46,7 @@ kvmmake(void)
     kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
     // allocate and map a kernel stack for each process.
-    // proc_mapstacks(kpgtbl);
+    proc_mapstacks(kpgtbl);
 
     return kpgtbl;
 }
@@ -115,10 +117,25 @@ walkaddr(pagetable_t pagetable, uint64 va)
         return 0;
 
     pte = walk(pagetable, va, 0);
-    if(pte == 0)
-        return 0;
-    if((*pte & PTE_V) == 0)
-        return 0;
+    if(pte == 0 || (*pte & PTE_V) == 0) {
+        if (check_va(myproc(), va) != 0) {
+            return 0;
+        }
+
+        void* mem = kalloc();
+        if (mem == 0) {
+            printf("walkaddr: lazy alloc out of memory\n");
+            return 0;
+        }
+        memset(mem, 0, PGSIZE);
+        if (mappages(pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_U) != 0) {
+            kfree(mem);
+            printf("walkaddr: lazy alloc failed to map pages");
+            return 0;
+        }
+        pte = walk(pagetable, va, 0);
+    }
+
     if((*pte & PTE_U) == 0)
         return 0;
     pa = PTE2PA(*pte);
@@ -178,9 +195,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
     for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
         if((pte = walk(pagetable, a, 0)) == 0)
-            panic("uvmunmap: walk");
+            //panic("uvmunmap: walk");
+            continue;
         if((*pte & PTE_V) == 0)
-            panic("uvmunmap: not mapped");
+            //panic("uvmunmap: not mapped");
+            continue;
         if(PTE_FLAGS(*pte) == PTE_V)
             panic("uvmunmap: not a leaf");
         if(do_free){
@@ -302,28 +321,64 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+// int
+// uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+// {
+//   pte_t *pte;
+//   uint64 pa, i;
+//   uint flags;
+//   char *mem;
+
+//   for(i = 0; i < sz; i += PGSIZE){
+//     if((pte = walk(old, i, 0)) == 0)
+//       panic("uvmcopy: pte should exist");
+//     if((*pte & PTE_V) == 0)
+//       panic("uvmcopy: page not present");
+//     pa = PTE2PA(*pte);
+//     flags = PTE_FLAGS(*pte);
+//     if((mem = kalloc()) == 0)
+//       goto err;
+//     memmove(mem, (char*)pa, PGSIZE);
+//     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+//       kfree(mem);
+//       goto err;
+//     }
+//   }
+//   return 0;
+
+//  err:
+//   uvmunmap(new, 0, i / PGSIZE, 1);
+//   return -1;
+// }
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
     pte_t *pte;
     uint64 pa, i;
     uint flags;
-    char *mem;
 
     for(i = 0; i < sz; i += PGSIZE){
         if((pte = walk(old, i, 0)) == 0)
-            panic("uvmcopy: pte should exist");
+            //panic("uvmcopy: pte should exist");
+            continue;
         if((*pte & PTE_V) == 0)
-            panic("uvmcopy: page not present");
+            //panic("uvmcopy: page not present");
+            continue;
         pa = PTE2PA(*pte);
         flags = PTE_FLAGS(*pte);
-        if((mem = kalloc()) == 0)
-            goto err;
-        memmove(mem, (char*)pa, PGSIZE);
-        if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-            kfree(mem);
+
+        if (flags & PTE_W) {
+            flags |= PTE_COW;
+            flags &= (~PTE_W);
+            *pte |= PTE_COW;
+            *pte &= (~PTE_W);
+        }
+        if(mappages(new, i, PGSIZE, pa, flags) != 0){
             goto err;
         }
+        acquire_ref_lock();
+        inc_ref((void*)pa);
+        release_ref_lock();
     }
     return 0;
 
@@ -356,12 +411,38 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     while(len > 0){
         va0 = PGROUNDDOWN(dstva);
         pa0 = walkaddr(pagetable, va0);
-        if(pa0 == 0)
-            return -1;
+        if(pa0 == 0) {
+            if (check_va(myproc(), va0) != 0) {
+                return -1;
+            }
+        }
+
+        struct proc *p = myproc();
+        pte_t *pte = walk(pagetable, va0, 0);
+        if (*pte == 0){
+            p->killed = 1;
+        }
+
+        if ((va0 < p->sz) && (*pte & PTE_V) && (*pte & PTE_COW) && !(PTE_W & *pte)) {
+            void* mem = kalloc();
+            if (mem == 0) {
+                printf("copyout: failed to alloc cow page\n");
+            } else {
+                memmove(mem, (char*)pa0, PGSIZE);
+                uint flags = PTE_FLAGS(*pte);
+                uvmunmap(pagetable, va0, 1, 1);
+                *pte = (PA2PTE(mem) | flags | PTE_W);
+                *pte &= ~PTE_COW;
+                pa0 = (uint64)mem;
+            }
+        }
+
+
         n = PGSIZE - (dstva - va0);
         if(n > len)
             n = len;
-        memmove((void *)(pa0 + (dstva - va0)), src, n);
+        if (pa0 != 0)
+            memmove((void *)(pa0 + (dstva - va0)), src, n);
 
         len -= n;
         src += n;
@@ -381,12 +462,13 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
     while(len > 0){
         va0 = PGROUNDDOWN(srcva);
         pa0 = walkaddr(pagetable, va0);
-        if(pa0 == 0)
+        if (pa0 == 0 && check_va(myproc(), srcva) != 0)
             return -1;
         n = PGSIZE - (srcva - va0);
         if(n > len)
             n = len;
-        memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+        if (pa0 != 0)
+            memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
         len -= n;
         dst += n;
@@ -436,4 +518,122 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
     } else {
         return -1;
     }
+}
+
+void do_vmprint(pagetable_t tbl, int level) {
+    // there are 2^9 = 512 PTEs in a page table.
+    for(int i = 0; i < 512; i++){
+        pte_t pte = tbl[i];
+        if (pte & PTE_V) {
+            for (int i = 0; i < level; i++) {
+                printf(".. ");
+            }
+            printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+
+            if ((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+                // this PTE points to a lower-level page table.
+                uint64 child = PTE2PA(pte);
+                do_vmprint((pagetable_t)child, level+1);
+            }
+        }
+    }
+}
+
+void vmprint(pagetable_t tbl) {
+    printf("page table: %p\n", tbl);
+    do_vmprint(tbl, 1);
+}
+
+int check_va(struct proc* p, uint64 va) {
+    acquire(&p->lock);
+    if (va>=MAXVA) {
+        //printf("check_va: exceeds max va\n");
+        release(&p->lock);
+        return -1;
+    }
+    if (va >= p->sz) {
+        //printf("check_va: bigger than sz | va: %p | sz: %p\n", va, p->sz);
+        release(&p->lock);
+        return -1;
+    }
+    if (va < PGROUNDDOWN(p->trapframe->sp)) {
+        //printf("check_va: va is under stack | va: %p | ustack: %p | ROUNDDOWN(sp): %p\n", va, p->ustack, PGROUNDDOWN(p->trapframe->sp));
+        release(&p->lock);
+        return -1;
+    }
+    release(&p->lock);
+    return 0;
+}
+
+int is_cow(pagetable_t tbl, uint64 va) {
+    pte_t* pte = walk(tbl, va, 0);
+    if (pte == 0) {
+        return 0;
+    }
+
+    uint flags = PTE_FLAGS(*pte);
+
+    if ((flags & PTE_V) == 0) {
+        return 0;
+    }
+    if ((flags & PTE_U) == 0) {
+        return 0;
+    }
+    if ((flags & PTE_COW) == 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+int cow_copy(pagetable_t tbl, uint64 va) {
+    pte_t* pte = walk(tbl, va, 0);
+    uint flags = PTE_FLAGS(*pte);
+    if (pte == 0) {
+        printf("cow: PTE not found\n");
+        return -2;
+    } else if (!((flags & PTE_V) && (flags & PTE_U) && (flags & PTE_COW))) {
+        printf("cow: invalid flags\n");
+        return -3;
+    } else {
+        flags |= PTE_W;
+        flags &= (~PTE_COW);
+
+        char* mem = kalloc();
+
+        if (mem == 0) {
+            printf("cow: out of memory\n");
+            return -4;
+        }
+
+        void* pa = (void*)PTE2PA(*pte);
+        memmove(mem, pa, PGSIZE);
+        uvmunmap(tbl, va, 1, 1);
+        if (mappages(tbl, va, PGSIZE, (uint64)mem, flags) != 0) {
+            printf("cow: failed to map pages");
+            kfree((void*)mem);
+            return -5;
+        }
+    }
+
+    return 0;
+}
+
+int lazy_alloc(pagetable_t tbl, uint64 va) {
+    void* mem = kalloc();
+
+    if (mem == 0) {
+        printf("lazy_alloc: failed to allocated memory\n");
+        return -1;
+    }
+    memset(mem, 0, PGSIZE);
+    int perm = PTE_W | PTE_R | PTE_U;
+
+    if (mappages(tbl, va, PGSIZE, (uint64)mem, perm) != 0) {
+        kfree(mem);
+        printf("lazy_alloc: failed to map pages\n");
+        return -2;
+    }
+
+    return 0;
 }

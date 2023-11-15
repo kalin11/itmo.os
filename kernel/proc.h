@@ -106,4 +106,5 @@ struct proc {
   char name[16];               // Process name (debugging)
   struct proc *next;
   struct proc *prev;
+  uint64 ustack;
 };
